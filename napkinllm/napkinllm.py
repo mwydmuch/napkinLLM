@@ -394,6 +394,7 @@ MODEL_EMOJIS = {
     "mistral": "🌪️",
     "bert": "🐦",
     "qwen": "🌊",
+    "deepseek": ""
 
     # Not supported/tested yet
     # "gemini": "♊",
