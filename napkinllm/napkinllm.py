@@ -23,20 +23,38 @@
 
 
 import os
-import torch
-import transformers
 import gzip
 import json
 import pickle
 import platform
+import multiprocessing
 from typing import Any
 from math import gcd
 from abc import ABC, abstractmethod
+
 from tqdm import tqdm
-import multiprocessing
-import torch
-import torch.multiprocessing as mp
-from torch.utils.data import Dataset
+
+try:
+    import torch
+    import torch.multiprocessing as torch_mp
+    from torch.utils.data import Dataset
+    import transformers
+
+    _LOCAL_AVAILABLE = True
+except ImportError:
+    _LOCAL_AVAILABLE = False
+
+try:
+    from openai import OpenAI
+    _OPENAI_AVAILABLE = True
+except ImportError:
+    _OPENAI_AVAILABLE = False
+
+try:
+    from anthropic import Anthropic
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
 
 
 try:
@@ -59,16 +77,32 @@ class LLMProvider(ABC):
         self.task = task
 
     @staticmethod
-    def factory(engine, model, task="gen", engine_params=None):
-        if engine == "vllm":
-            if not _VLLM_AVAILABLE:
-                raise ValueError("vLLM is not available, please first install it using `pip install vllm`")
-    
-            return VLLMProvider(model, task=task, engine_params=engine_params)
-        elif engine in ["hf", "huggingface"]:
-            return HFProvider(model, task=task, engine_params=engine_params)
+    def factory(engine, model, task="gen", engine_params=None, mode="local"):
+        engine = engine.lower()
+        mode = mode.lower()
+        if mode == "local":
+            if engine == "vllm":
+                if not _VLLM_AVAILABLE:
+                    raise ValueError("vLLM is not available, please install it using `pip install napkinLLM[vllm]`")
+        
+                return VLLMProvider(model, task=task, engine_params=engine_params)
+            elif engine in ["hf", "huggingface"]:
+                return HFProvider(model, task=task, engine_params=engine_params)
+            elif engine in ["openai", "claude", "anthropic"]:
+                raise ValueError(f"Engine {engine} requires mode='api'")
+            else:
+                raise ValueError(f"Engine {engine} is not supported")
+        elif mode == "api":
+            if engine in ["openai", "gpt"]:
+                return OpenAIProvider(model, task=task, engine_params=engine_params)
+            elif engine in ["claude", "anthropic"]:
+                return ClaudeProvider(model, task=task, engine_params=engine_params)
+            elif engine in ["vllm", "hf", "huggingface"]:
+                raise ValueError(f"Engine {engine} requires mode='local'")
+            else:
+                raise ValueError(f"Engine {engine} is not supported")
         else:
-            raise ValueError(f"Engine {engine} is not supported")
+            raise ValueError(f"Mode {mode} is not supported")
     
     def _check_task(self, method):
         if (self.task == "gen" and method == "embed") or (self.task == "embed" and (method == "generate" or method == "logprobs")):
@@ -90,8 +124,58 @@ class LLMProvider(ABC):
         pass
     
     
+def _ensure_local_dependencies():
+    if not _LOCAL_AVAILABLE:
+        raise ValueError("Local inference requires torch and transformers. Install with `pip install napkinLLM[local]` or use mode='api'")
+
+
+def _ensure_openai_available():
+    if not _OPENAI_AVAILABLE:
+        raise ValueError("OpenAI SDK is not available, please install it using `pip install napkinLLM[openai]`")
+
+
+def _ensure_anthropic_available():
+    if not _ANTHROPIC_AVAILABLE:
+        raise ValueError("Anthropic SDK is not available, please install it using `pip install napkinLLM[claude]`")
+
+
+def _usage_to_dict(usage):
+    if usage is None:
+        return None
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump()
+    if isinstance(usage, dict):
+        return usage
+    return dict(usage)
+
+
+def _normalize_api_messages(item):
+    if isinstance(item, str):
+        return [{"role": "user", "content": item}]
+    if isinstance(item, dict):
+        return [item]
+    if isinstance(item, list):
+        return item
+    raise ValueError("Unsupported input format for API chat, expected string or list of messages")
+
+
+def _split_system_messages(messages):
+    system_parts = []
+    filtered_messages = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content", "")
+        if role == "system":
+            system_parts.append(str(content))
+        else:
+            filtered_messages.append(message)
+    system = "\n".join([part for part in system_parts if part])
+    return system if system else None, filtered_messages
+
+
 class LocalProvider(LLMProvider):
     def __init__(self, model, task="gen", engine_params=None):
+        _ensure_local_dependencies()
         super().__init__(model, task=task, engine_params=engine_params)
         self.model_config = transformers.AutoConfig.from_pretrained(model)
         self.context_len = _dict_get_and_del(engine_params, "context_len", getattr(self.model_config, 'max_position_embeddings', 512))
@@ -172,6 +256,145 @@ class HFProvider(LocalProvider):
             sampling_params = {}
         return self.pipeline(inputs, **sampling_params)
     
+
+class OpenAIProvider(LLMProvider):
+    def __init__(self, model, task="gen", engine_params=None):
+        _ensure_openai_available()
+        super().__init__(model, task=task, engine_params=engine_params)
+        engine_params = engine_params or {}
+
+        api_key = _dict_get_and_del(engine_params, "api_key", os.environ.get("OPENAI_API_KEY"))
+        base_url = _dict_get_and_del(
+            engine_params,
+            "base_url",
+            os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+        )
+        organization = _dict_get_and_del(
+            engine_params,
+            "organization",
+            os.environ.get("OPENAI_ORG_ID") or os.environ.get("OPENAI_ORGANIZATION")
+        )
+        project = _dict_get_and_del(engine_params, "project", os.environ.get("OPENAI_PROJECT_ID"))
+        timeout = _dict_get_and_del(engine_params, "timeout", None)
+        max_retries = _dict_get_and_del(engine_params, "max_retries", None)
+
+        client_kwargs = {}
+        if api_key:
+            client_kwargs["api_key"] = api_key
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        if organization:
+            client_kwargs["organization"] = organization
+        if project:
+            client_kwargs["project"] = project
+        if timeout is not None:
+            client_kwargs["timeout"] = timeout
+        if max_retries is not None:
+            client_kwargs["max_retries"] = max_retries
+
+        self.client = OpenAI(**client_kwargs)
+
+    def embed(self, inputs, embed_params=None):
+        self._check_task("embed")
+        if any(not isinstance(item, str) for item in inputs):
+            raise ValueError("Embedding inputs must be strings for OpenAI API")
+
+        embed_params = embed_params or {}
+        response = self.client.embeddings.create(model=self.model, input=inputs, **embed_params)
+        return [item.embedding for item in response.data]
+
+    def logprobs(self, inputs, sampling_params=None):
+        self._check_task("logprobs")
+        raise NotImplementedError("Logprobs task is not implemented for OpenAI API engine")
+
+    def generate(self, inputs, sampling_params=None, guided_options_request=None, apply_chat_template=False, stop_tokens=None):
+        self._check_task("generate")
+        sampling_params = sampling_params or {}
+        if stop_tokens is not None and "stop" not in sampling_params:
+            sampling_params["stop"] = stop_tokens
+
+        outputs = []
+        for item in inputs:
+            messages = _normalize_api_messages(item)
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                **sampling_params
+            )
+            choice = response.choices[0] if response.choices else None
+            content = choice.message.content if choice and choice.message else None
+            outputs.append({
+                "text": content,
+                "usage": _usage_to_dict(response.usage),
+            })
+        return outputs
+
+
+class ClaudeProvider(LLMProvider):
+    def __init__(self, model, task="gen", engine_params=None):
+        _ensure_anthropic_available()
+        super().__init__(model, task=task, engine_params=engine_params)
+        engine_params = engine_params or {}
+
+        api_key = _dict_get_and_del(engine_params, "api_key", os.environ.get("ANTHROPIC_API_KEY"))
+        base_url = _dict_get_and_del(engine_params, "base_url", os.environ.get("ANTHROPIC_BASE_URL"))
+        timeout = _dict_get_and_del(engine_params, "timeout", None)
+        max_retries = _dict_get_and_del(engine_params, "max_retries", None)
+
+        client_kwargs = {}
+        if api_key:
+            client_kwargs["api_key"] = api_key
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        if timeout is not None:
+            client_kwargs["timeout"] = timeout
+        if max_retries is not None:
+            client_kwargs["max_retries"] = max_retries
+
+        self.client = Anthropic(**client_kwargs)
+
+    def embed(self, inputs, embed_params=None):
+        self._check_task("embed")
+        raise NotImplementedError("Embedding task is not implemented for Claude API engine")
+
+    def logprobs(self, inputs, sampling_params=None):
+        self._check_task("logprobs")
+        raise NotImplementedError("Logprobs task is not implemented for Claude API engine")
+
+    def generate(self, inputs, sampling_params=None, guided_options_request=None, apply_chat_template=False, stop_tokens=None):
+        self._check_task("generate")
+        outputs = []
+
+        for item in inputs:
+            params = dict(sampling_params or {})
+            if stop_tokens is not None and "stop_sequences" not in params:
+                params["stop_sequences"] = stop_tokens
+
+            messages = _normalize_api_messages(item)
+            system, messages = _split_system_messages(messages)
+            if system:
+                params["system"] = system
+            max_tokens = params.pop("max_tokens", 1024)
+
+            response = self.client.messages.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=max_tokens,
+                **params
+            )
+            text_parts = []
+            for block in response.content:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                else:
+                    text = getattr(block, "text", None)
+                if text:
+                    text_parts.append(text)
+            outputs.append({
+                "text": "".join(text_parts),
+                "usage": _usage_to_dict(response.usage),
+            })
+        return outputs
 
 if _VLLM_AVAILABLE:
     class VLLMProvider(LocalProvider):
@@ -341,6 +564,7 @@ def _run_inference_subprocess(
     task: str,
     model: str,
     inputs: list[str] | list[list[dict[str, str]]],
+    mode: str,
     engine: str,
     gpus: int | str | list[int] | None,
     kwargs_dict: dict[str, Any],
@@ -352,19 +576,21 @@ def _run_inference_subprocess(
         else:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus)
 
-    print(f"Running subprocess {multiprocessing.current_process()} with {gpus=}, {os.environ['CUDA_VISIBLE_DEVICES']=}")
-    return run_inference(task, model, inputs, engine, **kwargs_dict)
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "unset")
+    print(f"Running subprocess {multiprocessing.current_process()} with {gpus=}, CUDA_VISIBLE_DEVICES={cuda_visible}")
+    return run_inference(task, model, inputs, mode=mode, engine=engine, **kwargs_dict)
 
 def run_inference(    
     task: str,
     model: str,
     inputs: list[str] | list[list[dict[str, str]]],
+    mode: str = "local",
     engine: str = "vllm",
     **kwargs):
 
     # Set engine params
     engine_params = _filter_params_using_prefix(kwargs, "engine")   
-    llm = LLMProvider.factory(engine, model, task=task, engine_params=engine_params)
+    llm = LLMProvider.factory(engine, model, task=task, engine_params=engine_params, mode=mode)
 
     # Run task
     if task == "gen":
@@ -394,12 +620,12 @@ MODEL_EMOJIS = {
     "mistral": "🌪️",
     "bert": "🐦",
     "qwen": "🌊",
-    "deepseek": ""
+    "deepseek": "",
+    "claude": "🎼",
+    "gpt": "🤖"
 
     # Not supported/tested yet
     # "gemini": "♊",
-    # "claude": "🎼",
-    # "gpt": "🤖",
     # "palm": "🌴",
     # "phi": "φ",
     # "bloom": "🌸",
@@ -410,6 +636,10 @@ ENGINE_EMOJIS = {
     "hf": "🤗",
     "huggingface": "🤗",
     "vllm": "🚀",
+    "openai": "🤖",
+    "gpt": "🤖",
+    "claude": "🎼",
+    "anthropic": "🎼",
 }
 
 def _find_emoji(text, emojis, default=""):
@@ -424,11 +654,13 @@ def napkinllm(
     model: str,
     input_path: str,
     output_path: str,
+    mode: str = "local",
     engine: str = "vllm",
     parallel: int = 1,
     input_range: tuple[int, int] | None = None,
     **kwargs
 ):
+    engine_key = engine.lower()
     header = f"""
  |`\                            _     _         _      _      __  __ 
  |  `\     _ __    __ _  _ __  | | __(_) _ __  | |    | |    |  \/  |
@@ -441,7 +673,8 @@ def napkinllm(
 {_find_emoji(model, MODEL_EMOJIS, default=["💃","🕺"])} Model: {model}
 ⬅️ Input: {input_path}
 ➡️ Output: {output_path}
-{ENGINE_EMOJIS[engine]} Engine: {engine}
+{ENGINE_EMOJIS.get(engine_key, "")} Engine: {engine}
+🏷️ Mode: {mode}
 🎛️ Args: {kwargs}
 """
     print(header)
@@ -455,29 +688,44 @@ def napkinllm(
     print(f"Read {len(inputs)} inputs")
 
     if parallel > 1:
-        if not torch.cuda.is_available() or torch.cuda.device_count() < parallel:
-            raise ValueError(f"Cannot run inference in {parallel} processes without at least {parallel} GPUs")
-        
-        # Set start method to spawn
-        mp.set_start_method('spawn')
-        if engine == "vllm":
-            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        mode = mode.lower()
+        if mode == "local":
+            if not _LOCAL_AVAILABLE:
+                raise ValueError("Local inference requires torch and transformers. Install with `pip install napkinLLM[local]` or use mode='api'")
+            if not torch.cuda.is_available() or torch.cuda.device_count() < parallel:
+                raise ValueError(f"Cannot run inference in {parallel} processes without at least {parallel} GPUs")
 
-        gpus = list(range(torch.cuda.device_count()))
-        splited_inputs = _split_list(inputs, parallel)
-        splited_gpu_ids = _split_list(gpus, parallel)
-        subprocess_args = [(task, model, i, engine, g, kwargs) for i, g in zip(splited_inputs, splited_gpu_ids)]
-        print(f"Running inference in parallel in {parallel} processes, on {splited_gpu_ids} gpus")
+            # Set start method to spawn
+            torch_mp.set_start_method('spawn')
+            if engine == "vllm":
+                os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-        #with multiprocessing.Pool(processes=parallel) as pool:
-        with mp.Pool() as pool:
-            pool_outputs = pool.starmap(_run_inference_subprocess, subprocess_args)
+            gpus = list(range(torch.cuda.device_count()))
+            splited_inputs = _split_list(inputs, parallel)
+            splited_gpu_ids = _split_list(gpus, parallel)
+            subprocess_args = [(task, model, i, mode, engine, g, kwargs) for i, g in zip(splited_inputs, splited_gpu_ids)]
+            print(f"Running inference in parallel in {parallel} processes, on {splited_gpu_ids} gpus")
+
+            #with multiprocessing.Pool(processes=parallel) as pool:
+            with torch_mp.Pool() as pool:
+                pool_outputs = pool.starmap(_run_inference_subprocess, subprocess_args)
+        elif mode == "api":
+            mp = multiprocessing
+            mp.set_start_method('spawn')
+            splited_inputs = _split_list(inputs, parallel)
+            subprocess_args = [(task, model, i, mode, engine, None, kwargs) for i in splited_inputs]
+            print(f"Running inference in parallel in {parallel} processes with API engine")
+
+            with mp.Pool() as pool:
+                pool_outputs = pool.starmap(_run_inference_subprocess, subprocess_args)
+        else:
+            raise ValueError(f"Mode {mode} is not supported")
 
         outputs = []
         for o in pool_outputs:
             outputs.extend(o)
     else:
-        outputs = run_inference(task, model, inputs, engine=engine, **kwargs)
+        outputs = run_inference(task, model, inputs, mode=mode, engine=engine, **kwargs)
 
     # Write output
     _write_output(output_path, outputs)
